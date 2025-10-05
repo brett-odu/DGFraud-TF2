@@ -59,7 +59,8 @@ def Player2Vec_main(support: list,
     :param args: additional parameters
     """
     model = Player2Vec(args.input_dim, args.nhid, args.output_dim, args)
-    optimizer = optimizers.Adam(lr=args.lr)
+    # optimizer = optimizers.Adam(lr=args.lr)
+    optimizer = optimizers.legacy.Adam(learning_rate=args.lr)
 
     # train
     for epoch in tqdm(range(args.epochs)):

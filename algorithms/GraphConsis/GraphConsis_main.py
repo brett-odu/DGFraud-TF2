@@ -9,7 +9,7 @@ import argparse
 import numpy as np
 from collections import namedtuple
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
 import tensorflow as tf
 
@@ -20,17 +20,17 @@ from utils.utils import preprocess_feature
 # init the common args, expect the model specific args
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=717, help='random seed')
-parser.add_argument('--epochs', type=int, default=5,
+parser.add_argument('--epochs', type=int, default=200,
                     help='number of epochs to train')
 parser.add_argument('--batch_size', type=int, default=512, help='batch size')
 parser.add_argument('--train_size', type=float, default=0.8,
                     help='training set percentage')
-parser.add_argument('--lr', type=float, default=0.5, help='learning rate')
+parser.add_argument('--lr', type=float, default=0.005, help='learning rate')
 parser.add_argument('--nhid', type=int, default=128,
                     help='number of hidden units')
-parser.add_argument('--sample_sizes', type=list, default=[5, 5],
+parser.add_argument('--sample_sizes', type=list, default=[10, 5],
                     help='number of samples for each layer')
-parser.add_argument('--identity_dim', type=int, default=0,
+parser.add_argument('--identity_dim', type=int, default=100,
                     help='dimension of context embedding')
 parser.add_argument('--eps', type=float, default=0.001,
                     help='consistency score threshold ε')
@@ -68,7 +68,7 @@ def GraphConsis_main(neigh_dicts, features, labels, masks, num_classes, args):
 
     model = GraphConsis(features.shape[-1], args.nhid,
                         len(args.sample_sizes), num_classes, len(neigh_dicts))
-    optimizer = tf.keras.optimizers.SGD(learning_rate=args.lr)
+    optimizer = tf.keras.optimizers.legacy.SGD(learning_rate=args.lr)
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
 
     for epoch in range(args.epochs):
@@ -94,19 +94,47 @@ def GraphConsis_main(neigh_dicts, features, labels, masks, num_classes, args):
         val_results = model(build_batch(val_nodes, neigh_dicts,
                                         args.sample_sizes, features), features)
         loss = loss_fn(tf.convert_to_tensor(labels[val_nodes]), val_results)
-        val_acc = accuracy_score(labels[val_nodes],
-                                 val_results.numpy().argmax(axis=1))
+
+        val_probs = val_results.numpy()
+        y_val = labels[val_nodes].ravel().astype(int)
+        y_val_pred = val_probs.argmax(axis=1)
+
+        val_acc = accuracy_score(y_val, y_val_pred)
+
+        # F1 + AUC (binary vs. multiclass safe)
+        if val_probs.shape[1] == 2:
+            val_f1 = f1_score(y_val, y_val_pred)  # binary, pos_label=1 by default
+            val_auc = roc_auc_score(y_val, val_probs[:, 1])
+        else:
+            # multiclass fallback: macro-averaged, one-vs-rest
+            val_f1 = f1_score(y_val, y_val_pred, average='macro')
+            val_auc = roc_auc_score(y_val, val_probs, multi_class='ovr', average='macro')
+
         print(f" Epoch: {epoch:d}, "
               f"loss: {loss.numpy():.4f}, "
-              f"acc: {val_acc:.4f}")
+              f"acc: {val_acc:.4f}, "
+              f"F1: {val_f1:.4f}, "
+              f"AUC: {val_auc:.4f}")
 
     # testing
     print("Testing...")
     results = model(build_batch(test_nodes, neigh_dicts,
                                 args.sample_sizes, features), features)
-    test_acc = accuracy_score(labels[test_nodes],
-                              results.numpy().argmax(axis=1))
-    print(f"Test acc: {test_acc:.4f}")
+
+    test_probs = results.numpy()
+    y_test = labels[test_nodes].ravel().astype(int)
+    y_test_pred = test_probs.argmax(axis=1)
+
+    test_acc = accuracy_score(y_test, y_test_pred)
+
+    if test_probs.shape[1] == 2:
+        test_f1 = f1_score(y_test, y_test_pred)
+        test_auc = roc_auc_score(y_test, test_probs[:, 1])
+    else:
+        test_f1 = f1_score(y_test, y_test_pred, average='macro')
+        test_auc = roc_auc_score(y_test, test_probs, multi_class='ovr', average='macro')
+
+    print(f"Test acc: {test_acc:.4f}, F1: {test_f1:.4f}, AUC: {test_auc:.4f}")
 
 
 def build_batch(nodes: list, neigh_dicts: dict, sample_sizes: list,
@@ -167,12 +195,25 @@ def compute_diffusion_matrix(dst_nodes, neigh_dict, sample_size,
     def sample(n, ns):
         if len(ns) == 0:
             return []
-        consis = calc_consistency_score(n, ns)
 
-        # Equation 4 in the paper
-        prob = consis / tf.reduce_sum(consis)
-        return np.random.choice(ns, min(len(ns), sample_size),
-                                replace=False, p=prob)
+        consis = calc_consistency_score(n, ns)  # Tensor
+        consis = tf.reshape(consis, [-1])  # ensure 1D
+        consis_np = consis.numpy().astype(np.float64)  # -> numpy
+
+        # Zero-out negatives/NaNs just in case, and sum
+        consis_np = np.where(np.isfinite(consis_np) & (consis_np > 0), consis_np, 0.0)
+        s = consis_np.sum()
+
+        if s <= 0.0:
+            # All neighbors were below eps — fallback: uniform probs
+            probs = np.full(len(ns), 1.0 / len(ns), dtype=np.float64)
+        else:
+            probs = consis_np / s
+            # Re-normalize defensively
+            probs = probs / probs.sum()
+
+        k = min(len(ns), sample_size)
+        return np.random.choice(ns, k, replace=False, p=probs)
 
     def vectorize(ns):
         v = np.zeros(max_node_id + 1, dtype=np.float32)
@@ -182,12 +223,15 @@ def compute_diffusion_matrix(dst_nodes, neigh_dict, sample_size,
     # sample neighbors
     adj_mat_full = np.stack([vectorize(sample(n, neigh_dict[n]))
                              for n in dst_nodes])
-    nonzero_cols_mask = np.any(adj_mat_full.astype(np.bool), axis=0)
+    nonzero_cols_mask = np.any(adj_mat_full.astype(bool), axis=0)
 
     # compute diffusion matrix
     adj_mat = adj_mat_full[:, nonzero_cols_mask]
     adj_mat_sum = np.sum(adj_mat, axis=1, keepdims=True)
-    dif_mat = np.nan_to_num(adj_mat / adj_mat_sum)
+    # dif_mat = np.nan_to_num(adj_mat / adj_mat_sum)
+    mask = (adj_mat_sum > 0)
+    safe_sum = np.where(mask, adj_mat_sum, 1.0)
+    dif_mat = adj_mat / safe_sum
 
     # compute dstsrc mappings
     src_nodes = np.arange(nonzero_cols_mask.size)[nonzero_cols_mask]
